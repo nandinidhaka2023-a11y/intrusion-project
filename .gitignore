@@ -6,3 +6,4 @@ data/processed/*.parquet
 data/processed/*.npy
 *.joblib
 *.pt
+.venv/
