@@ -6,7 +6,7 @@ from datetime import datetime
 
 import numpy as np
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
 
 
@@ -22,7 +22,12 @@ sys.path.append(
     os.path.dirname(os.path.abspath(__file__))
 )
 
-from predictor import IntrusionPredictor
+from predictor import (
+    IntrusionPredictor,
+    HIGH_THRESHOLD,
+    MEDIUM_THRESHOLD,
+)
+from ip_checker import ThreatIntel, check_ip
 
 
 X_PATH = os.path.join(
@@ -56,6 +61,10 @@ app = Flask(
     template_folder=os.path.join(
         BASE_DIR,
         "templates"
+    ),
+    static_folder=os.path.join(
+        BASE_DIR,
+        "static"
     )
 )
 
@@ -71,6 +80,19 @@ print("Loading intrusion predictor...")
 predictor = IntrusionPredictor()
 
 print("Predictor loaded successfully.")
+print(f"Risk calibration temperature: {predictor.temperature}")
+
+threat_intel = ThreatIntel()
+print(f"Blocklists: {threat_intel.status()}")
+
+# Optional: set ABUSEIPDB_API_KEY in your environment for live reputation checks.
+ABUSEIPDB_KEY = os.environ.get("ABUSEIPDB_API_KEY") or None
+
+SIMULATED_NOTE = (
+    "Note: the addresses in this demo stream are simulated (the dataset has no "
+    "real IPs), so this model result describes the replayed traffic labelled "
+    "with this address, not a real machine."
+)
 
 X = np.load(
     X_PATH,
@@ -153,6 +175,14 @@ if not stream_indices:
 
 events = []
 
+state_lock = threading.Lock()
+
+# Per-host running risk, filled by process_event()
+hosts = {}
+
+# Weight of the newest window in the running (EWMA) host risk.
+EWMA_ALPHA = 0.6
+
 state = {
     "processed": 0,
     "high_risk": 0,
@@ -160,6 +190,56 @@ state = {
     "low_risk": 0,
     "attack_types": {}
 }
+
+
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+
+def display_label(name):
+    """
+    The dataset stores the dash in 'Web Attack - XSS' as a broken character.
+    Fix it for display only; the raw name is still used to look windows up.
+    """
+    return str(name).replace("\ufffd", "-")
+
+
+def risk_from_probability(probability):
+    if probability >= HIGH_THRESHOLD:
+        return "HIGH"
+    if probability >= MEDIUM_THRESHOLD:
+        return "MEDIUM"
+    return "LOW"
+
+
+def update_host(host, probability, attack_type, time_text):
+    """
+    Keep a running risk per host. A single window is a noisy signal, so the
+    host risk is an exponentially weighted average of its recent windows
+    (the newest window counts 60 percent). The peak is kept separately so a
+    short, sharp attack is never hidden by later quiet traffic.
+    """
+    h = hosts.get(host)
+    if h is None:
+        h = {
+            "host": host,
+            "windows": 0,
+            "current": probability,
+            "peak": probability,
+            "high_windows": 0,
+            "attack_types": {},
+            "last_seen": time_text,
+        }
+        hosts[host] = h
+    else:
+        h["current"] = EWMA_ALPHA * probability + (1 - EWMA_ALPHA) * h["current"]
+        h["peak"] = max(h["peak"], probability)
+
+    h["windows"] += 1
+    if probability >= HIGH_THRESHOLD:
+        h["high_windows"] += 1
+    h["attack_types"][attack_type] = h["attack_types"].get(attack_type, 0) + 1
+    h["last_seen"] = time_text
 
 
 # ---------------------------------------------------------
@@ -184,15 +264,15 @@ def process_event(index):
         IPS[index]
     )
 
-    attack_type = str(
+    attack_type = display_label(
         ATTACK_TYPES[index]
     )
 
-    if probability >= 0.80:
+    if probability >= HIGH_THRESHOLD:
 
         status = "ALERT"
 
-    elif probability >= 0.50:
+    elif probability >= MEDIUM_THRESHOLD:
 
         status = "WARNING"
 
@@ -200,15 +280,21 @@ def process_event(index):
 
         status = "NORMAL"
 
+    time_text = datetime.now().strftime(
+        "%H:%M:%S"
+    )
 
     event = {
-        "time": datetime.now().strftime(
-            "%H:%M:%S"
-        ),
+        "time": time_text,
 
         "host": host,
 
         "probability": probability,
+
+        "raw_probability": result.get(
+            "raw_probability",
+            probability
+        ),
 
         "risk": risk,
 
@@ -217,42 +303,47 @@ def process_event(index):
         "status": status
     }
 
+    with state_lock:
 
-    events.insert(
-        0,
-        event
-    )
-
-    # Keep dashboard responsive
-    if len(events) > 100:
-        events.pop()
-
-
-    state["processed"] += 1
-
-
-    if risk == "HIGH":
-
-        state["high_risk"] += 1
-
-    elif risk == "MEDIUM":
-
-        state["medium_risk"] += 1
-
-    else:
-
-        state["low_risk"] += 1
-
-
-    state["attack_types"][
-        attack_type
-    ] = (
-        state["attack_types"].get(
-            attack_type,
-            0
+        events.insert(
+            0,
+            event
         )
-        + 1
-    )
+
+        # Keep dashboard responsive
+        if len(events) > 100:
+            events.pop()
+
+        state["processed"] += 1
+
+        if risk == "HIGH":
+
+            state["high_risk"] += 1
+
+        elif risk == "MEDIUM":
+
+            state["medium_risk"] += 1
+
+        else:
+
+            state["low_risk"] += 1
+
+        state["attack_types"][
+            attack_type
+        ] = (
+            state["attack_types"].get(
+                attack_type,
+                0
+            )
+            + 1
+        )
+
+        update_host(
+            host,
+            probability,
+            attack_type,
+            time_text
+        )
 
 
 # ---------------------------------------------------------
@@ -318,9 +409,12 @@ def dashboard():
 @app.route("/api/events")
 def get_events():
 
+    with state_lock:
+        snapshot = list(events)
+
     return jsonify(
         {
-            "events": events
+            "events": snapshot
         }
     )
 
@@ -328,8 +422,8 @@ def get_events():
 @app.route("/api/stats")
 def get_stats():
 
-    return jsonify(
-        {
+    with state_lock:
+        payload = {
             "processed": state["processed"],
 
             "high_risk": state["high_risk"],
@@ -338,11 +432,74 @@ def get_stats():
 
             "low_risk": state["low_risk"],
 
-            "attack_types": state[
-                "attack_types"
-            ]
+            "attack_types": dict(
+                state["attack_types"]
+            ),
+
+            "calibration_temperature": predictor.temperature,
+        }
+
+    return jsonify(payload)
+
+
+@app.route("/api/hosts")
+def get_hosts():
+    """One row per host with its running risk, most dangerous first."""
+
+    with state_lock:
+        rows = []
+
+        for h in hosts.values():
+            row = dict(h)
+            row["attack_types"] = dict(h["attack_types"])
+            row["risk"] = risk_from_probability(h["current"])
+            rows.append(row)
+
+    rows.sort(
+        key=lambda r: (r["current"], r["peak"]),
+        reverse=True
+    )
+
+    return jsonify(
+        {
+            "hosts": rows
         }
     )
+
+
+@app.route("/api/check_ip", methods=["GET", "POST"])
+def api_check_ip():
+    """
+    Is this address malicious? Combines what our model saw from the host,
+    downloaded blocklists and (optionally) AbuseIPDB. See ip_checker.py.
+    """
+
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        raw = body.get("ip", "")
+    else:
+        raw = request.args.get("ip", "")
+
+    raw = str(raw).strip()[:64]
+
+    with state_lock:
+        known = hosts.get(raw)
+        host_stats = (
+            {**known, "attack_types": dict(known["attack_types"])}
+            if known else None
+        )
+
+    result = check_ip(
+        raw,
+        host_stats=host_stats,
+        intel=threat_intel,
+        abuse_key=ABUSEIPDB_KEY,
+        sim_note=SIMULATED_NOTE if host_stats else None,
+    )
+
+    result["abuseipdb_enabled"] = bool(ABUSEIPDB_KEY)
+
+    return jsonify(result), (200 if result["valid"] else 400)
 
 
 # ---------------------------------------------------------
